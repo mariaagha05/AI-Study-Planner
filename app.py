@@ -86,6 +86,11 @@ div[data-baseweb="select"] > div {
 .s-main { color:#1f2937; font-size:1.05rem; flex:1; min-width:200px; }
 .chip { background:#e1efe1; color:#14532d; border-radius:999px; padding:.15rem .7rem;
         font-size:.9rem; font-weight:700; }
+.bar-row { display:flex; align-items:center; gap:.8rem; margin:.5rem 0; }
+.bar-name { width:150px; font-weight:700; color:#1f2937; font-size:1.05rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bar-track { flex:1; background:#e5efe5; border-radius:999px; height:18px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:999px; }
+.bar-val { width:70px; text-align:right; font-weight:800; color:#14532d; font-size:1.05rem; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -638,7 +643,16 @@ if st.session_state.plan_df is not None:
                 st.progress(t_done / t_all if t_all else 0.0,
                             text=f"{sub}: {t_done / 60:.1f} / {t_all / 60:.1f} h{extra}")
             st.markdown("### Hours per subject")
-            st.bar_chart((plan.groupby("Subject")["Minutes"].sum() / 60.0).rename("Hours"))
+            per_sub = plan.groupby("Subject")["Minutes"].sum().sort_values(ascending=False)
+            top = max(int(per_sub.max()), 1)
+            bars = "".join(
+                f'<div class="bar-row"><div class="bar-name">{escape(str(n))}</div>'
+                f'<div class="bar-track"><div class="bar-fill" style="width:{max(3, 100 * int(m) // top)}%;'
+                f'background:{color_for(n)}"></div></div>'
+                f'<div class="bar-val">{int(m) / 60:.1f} h</div></div>'
+                for n, m in per_sub.items()
+            )
+            st.markdown(f'<div class="day-card">{bars}</div>', unsafe_allow_html=True)
 
     with tab4:
         if plan.empty:
