@@ -5,7 +5,7 @@ Run:  streamlit run app.py
 import json
 import os
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 
 import pandas as pd
@@ -21,7 +21,9 @@ except Exception:  # library missing -> app still works with the built-in planne
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="AI Study Planner", page_icon="📚", layout="wide")
 
-MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+PREFERRED_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]   # Groq's current production text models
+MODEL_CHOICES = ["Auto (recommended)"] + PREFERRED_MODELS
+NON_CHAT = ("whisper", "guard", "tts", "orpheus", "safeguard", "compound", "embed", "distil-whisper")
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TYPES = ["Learn", "Practice", "Revise", "Mock test"]
 PALETTE = ["#2e7d32", "#1565c0", "#ef6c00", "#6a1b9a", "#00838f", "#c62828", "#827717", "#4527a0"]
@@ -236,14 +238,39 @@ Rules:
 Return ONLY this JSON shape:
 {{"advice": "2-3 sentence personalised study strategy",
   "sessions": [{{"d": "YYYY-MM-DD", "s": "Subject", "t": "specific topic", "m": 45, "k": "Learn|Practice|Revise|Mock test"}}]}}"""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.3,
-        max_tokens=8000,
-        response_format={"type": "json_object"},
-    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    resp, last_err = None, None
+    # Different Groq models/SDK versions accept different parameter names -> try safely.
+    for extra in ({"max_completion_tokens": 12000, "reasoning_effort": "low"},
+                  {"max_completion_tokens": 12000},
+                  {"max_tokens": 8000}):
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, temperature=0.3,
+                response_format={"type": "json_object"}, **extra)
+            break
+        except Exception as e:
+            if type(e).__name__ in ("NotFoundError", "AuthenticationError",
+                                    "PermissionDeniedError", "RateLimitError"):
+                raise
+            last_err = e
+    if resp is None:
+        raise last_err or RuntimeError("Groq request failed")
     return parse_json(resp.choices[0].message.content or "")
+
+
+def candidate_models(api_key: str, choice: str):
+    """Models to try, in order, based on what this API key can really access."""
+    try:
+        ids = [m.id for m in Groq(api_key=api_key).models.list().data]
+    except Exception:
+        ids = []
+    pool = [m for m in PREFERRED_MODELS if m in ids] if ids else list(PREFERRED_MODELS)
+    if ids and not pool:  # preferred models gone -> use any other chat model on the account
+        pool = [i for i in ids if not any(w in i.lower() for w in NON_CHAT)][:3]
+    if choice in ids or (not ids and choice in PREFERRED_MODELS):
+        pool = [choice] + [m for m in pool if m != choice]
+    return list(dict.fromkeys(pool))
 
 
 def norm_kind(k: str) -> str:
@@ -400,7 +427,7 @@ def render_calendar(plan: pd.DataFrame):
 def make_ics(plan: pd.DataFrame) -> str:
     def esc(s):
         return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", " ")
-    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//AI Study Planner//EN", "CALSCALE:GREGORIAN"]
     for i, r in plan.iterrows():
         s = datetime.combine(r["D"], r["Start"])
@@ -446,7 +473,7 @@ with st.sidebar:
     st.text_input("Groq API key", type="password", key="api_key_input",
                   placeholder="gsk_...", help="Or set GROQ_API_KEY as environment variable / Streamlit secret.")
     use_ai = st.checkbox("Use AI (Groq) to build the plan", value=True)
-    model = st.selectbox("AI model", MODELS, index=0)
+    model = st.selectbox("AI model", MODEL_CHOICES, index=0)
     start_date = st.date_input("Plan starts on", value=date.today(), min_value=date.today())
     day_start = st.time_input("Daily study start time", value=time(17, 0), step=900)
     session_len = st.slider("Preferred session length (min)", 25, 90, 45, step=5)
@@ -527,7 +554,10 @@ if go:
             elif use_ai:
                 total_cap = sum(capacity.values())
                 with st.spinner("🤖 The AI is designing your timetable..."):
-                    for mdl in dict.fromkeys([model, MODELS[1]]):
+                    cands = candidate_models(key, model)
+                    if not cands:
+                        st.warning("No usable Groq chat model was found for this API key.")
+                    for mdl in cands:
                         try:
                             data = call_groq(key, mdl, subs, capacity, session_len, start_date)
                             cand = validate_sessions(data.get("sessions", []), subs, capacity, start_date)
